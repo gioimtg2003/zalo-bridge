@@ -1,0 +1,22 @@
+{
+  "name": "@dilim/zalo-bridge",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "bun --watch src/main.ts",
+    "start": "bun src/main.ts",
+    "list-groups": "bun src/list-groups.ts",
+    "type-check": "tsc --noEmit"
+  },
+  "dependencies": {
+    "image-size": "^2.0.2",
+    "qrcode-terminal": "^0.12.0",
+    "zca-js": "^2.1.2"
+  },
+  "devDependencies": {
+    "@types/bun": "latest",
+    "@types/qrcode-terminal": "^0.12.2",
+    "typescript": "^5.8.3"
+  }
+}
