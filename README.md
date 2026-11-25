@@ -12,6 +12,30 @@ text, not JSON). Unknown route → `404 Not found` (plain text).
 x-dilim-zalo-bridge: $INTERNAL_SECRET
 ```
 
+## Multi-account
+
+`ZALO_ACCOUNTS` is a csv of account ids the process logs in to (each gets its own `Zalo`
+instance, own session file, own listener). Unset → single account `main` using the legacy
+`ZALO_SESSION_FILE` path.
+
+```
+ZALO_ACCOUNTS=main,sales
+→ data/zalo-session-main.json, data/zalo-session-sales.json
+```
+
+Login runs sequentially at boot, so QR codes are printed one at a time (`GET /qr?account=sales`
+serves the pending one). An account that fails to log in is skipped; the process exits only
+if none logged in.
+
+Pick the sending account per request. No header → first id in `ZALO_ACCOUNTS`:
+
+```
+x-zalo-account: sales
+```
+
+Unknown or not-logged-in id → `400 { ok:false, error, accounts }`. `/health`, `/status`,
+`/qr` ignore the header and take `?account=` instead.
+
 ## Target = threadId + threadType
 
 One addressing scheme for all send endpoints:
@@ -127,6 +151,7 @@ Broadcast returns `{ ok, sent }`; no target groups → `400`.
 | ------------------------------ | -------------------------------------------------------------------- |
 | `GET /find-user?phone=09...`   | `{ ok, user }`; `404 user not found` (ZaloApiError 216); `400` no phone |
 | `GET /groups`                  | `{ ok, groups:[{id,name}] }` — batches of 50 + 300ms sleep (rate limit) |
+| `GET /friends?count=&page=`    | `{ ok, friends }` — zca-js `getAllFriends`, defaults count=20000 page=1 |
 | `GET /group-info?groupId=a,b`  | `{ ok, info }` (gridInfoMap)                                          |
 | `GET /group-members?memberId=a,b` | `{ ok, profiles }`                                                 |
 
@@ -146,9 +171,11 @@ Broadcast returns `{ ok, sent }`; no target groups → `400`.
 
 | Route         | Response                                                         |
 | ------------- | ---------------------------------------------------------------- |
-| `GET /health` | `{ ok, uptime, loginStatus }`                                    |
-| `GET /status` | `{ loggedIn, ownId, loginInProgress, qrAvailable }`               |
+| `GET /health` | `{ ok, uptime, accounts: LoginStatus[] }`                         |
+| `GET /status` | `LoginStatus[]`; with `?account=x` → one `LoginStatus`            |
 | `GET /qr`     | `image/png` QR to scan; `404 { ok:false, error:"no QR pending" }` |
+
+`LoginStatus` = `{ accountId, loggedIn, ownId, loginInProgress, qrAvailable }`.
 
 ## Env
 
@@ -156,6 +183,9 @@ Broadcast returns `{ ok, sent }`; no target groups → `400`.
 | ----------------------- | ------------------------------------------ |
 | `INTERNAL_SECRET`       | Auth header value + secret sent to agent-ops |
 | `BRIDGE_PORT`           | HTTP port, default `2604`                  |
+| `ZALO_ACCOUNTS`         | csv account ids; unset → single `main`     |
+| `ZALO_SESSION_DIR`      | session dir in multi-account mode, default `./data` |
+| `ZALO_SESSION_FILE`     | session path in single-account mode        |
 | `GROUP_CANCELED_ORDER`  | csv group ids for `/noti-canceled`         |
 | `GROUP_DELIVERED_ORDER` | csv group ids for `/noti-delivered`        |
 | `BROADCAST_GROUP_IDS`   | csv default targets for `/noti-broadcast`  |

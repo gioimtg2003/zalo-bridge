@@ -2,114 +2,175 @@ import * as qrcodeTerminal from 'qrcode-terminal';
 import { LoginQRCallbackEventType, Zalo, type API, type Credentials } from 'zca-js';
 import { loadCredentials, saveCredentials } from './credential-store';
 
-const CREDENTIALS_FILE = process.env['ZALO_SESSION_FILE'] ?? './data/zalo-session.json';
+const LEGACY_SESSION_FILE = process.env['ZALO_SESSION_FILE'] ?? './data/zalo-session.json';
+const SESSION_DIR = process.env['ZALO_SESSION_DIR'] ?? './data';
 const USER_AGENT =
   process.env['ZALO_USER_AGENT'] ??
   'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
 
-// Module-level state — single-instance service, in-memory is sufficient
-let _api: API | null = null;
-let pendingQR: Buffer | null = null;
-let pendingQRExpiresAt = 0;
-let loginInProgress = false;
-let ownId: string | null = null;
+const configuredAccounts = (process.env['ZALO_ACCOUNTS'] ?? '')
+  .split(',')
+  .map((id) => id.trim())
+  .filter(Boolean);
 
-export function getPendingQR(): Buffer | null {
-  if (!pendingQR) return null;
-  if (Date.now() > pendingQRExpiresAt) {
-    pendingQR = null;
+/** Accounts this process logs in to. First one is the fallback for unrouted requests. */
+export const ACCOUNT_IDS: string[] = configuredAccounts.length > 0 ? configuredAccounts : ['agent'];
+export const DEFAULT_ACCOUNT_ID: string = ACCOUNT_IDS[0] as string;
+
+function sessionFile(accountId: string): string {
+  // ponytail: single-account deployments keep the historical path so existing sessions survive
+  if (configuredAccounts.length === 0) return LEGACY_SESSION_FILE;
+
+  if (accountId === 'agents') return LEGACY_SESSION_FILE;
+  return `${SESSION_DIR}/zalo-session-${accountId}.json`;
+}
+
+interface AccountState {
+  api: API | null;
+  ownId: string | null;
+  pendingQR: Buffer | null;
+  pendingQRExpiresAt: number;
+  loginInProgress: boolean;
+}
+
+const states = new Map<string, AccountState>();
+
+function stateOf(accountId: string): AccountState {
+  let state = states.get(accountId);
+  if (!state) {
+    state = {
+      api: null,
+      ownId: null,
+      pendingQR: null,
+      pendingQRExpiresAt: 0,
+      loginInProgress: false,
+    };
+    states.set(accountId, state);
+  }
+  return state;
+}
+
+export function isKnownAccount(accountId: string): boolean {
+  return ACCOUNT_IDS.includes(accountId);
+}
+
+export function getPendingQR(accountId: string = DEFAULT_ACCOUNT_ID): Buffer | null {
+  const state = stateOf(accountId);
+  if (!state.pendingQR) return null;
+  if (Date.now() > state.pendingQRExpiresAt) {
+    state.pendingQR = null;
     return null;
   }
-  return pendingQR;
+  return state.pendingQR;
 }
 
-export function getOwnId(): string | null {
-  return ownId;
+export function getOwnId(accountId: string = DEFAULT_ACCOUNT_ID): string | null {
+  return stateOf(accountId).ownId;
 }
 
-export function getLoginStatus(): {
+export interface LoginStatus {
+  accountId: string;
   loggedIn: boolean;
   ownId: string | null;
   loginInProgress: boolean;
   qrAvailable: boolean;
-} {
+}
+
+export function getLoginStatus(accountId: string = DEFAULT_ACCOUNT_ID): LoginStatus {
+  const state = stateOf(accountId);
   return {
-    loggedIn: _api !== null && ownId !== null,
-    ownId,
-    loginInProgress,
-    qrAvailable: getPendingQR() !== null,
+    accountId,
+    loggedIn: state.api !== null && state.ownId !== null,
+    ownId: state.ownId,
+    loginInProgress: state.loginInProgress,
+    qrAvailable: getPendingQR(accountId) !== null,
   };
 }
 
+export function getAllLoginStatus(): LoginStatus[] {
+  return ACCOUNT_IDS.map((id) => getLoginStatus(id));
+}
+
 /**
- * Flush current cookie to the credentials file.
+ * Flush an account's current cookie to its credentials file.
  * Called during graceful shutdown to preserve the freshest session state.
  */
-export async function flushSession(): Promise<void> {
-  if (!_api) return;
+export async function flushSession(accountId: string = DEFAULT_ACCOUNT_ID): Promise<void> {
+  const state = stateOf(accountId);
+  if (!state.api) return;
   try {
-    const jar = _api.getCookie() as unknown as { toJSON(): { cookies: Credentials['cookie'] } };
-    const ctx = _api.getContext();
+    const jar = state.api.getCookie() as unknown as {
+      toJSON(): { cookies: Credentials['cookie'] };
+    };
+    const ctx = state.api.getContext();
     const creds: Credentials = {
       cookie: jar.toJSON().cookies,
       imei: ctx.imei,
       userAgent: ctx.userAgent,
     };
-    await saveCredentials(CREDENTIALS_FILE, creds);
-    console.log('[zalo-bridge] final session flushed');
+    await saveCredentials(sessionFile(accountId), creds);
+    console.log(`[zalo-bridge][${accountId}] final session flushed`);
   } catch (err) {
-    console.error('[zalo-bridge] flush session failed', {
+    console.error(`[zalo-bridge][${accountId}] flush session failed`, {
       error: err instanceof Error ? err.message : String(err),
     });
   }
 }
 
-async function loginWithQR(zalo: Zalo): Promise<API> {
+export async function flushAllSessions(): Promise<void> {
+  await Promise.all([...states.keys()].map((id) => flushSession(id)));
+}
+
+async function loginWithQR(zalo: Zalo, accountId: string): Promise<API> {
+  const state = stateOf(accountId);
+
   return new Promise<API>((resolve, reject) => {
-    loginInProgress = true;
+    state.loginInProgress = true;
     let captured: Credentials | null = null;
 
     // 10 minutes per QR window — reset on each new QR so retries don't expire
     const QR_WINDOW_MS = 10 * 60 * 1000;
     let timeout = setTimeout(() => {
-      loginInProgress = false;
-      reject(new Error('[zalo-bridge] QR login timed out — no scan after 10 minutes'));
+      state.loginInProgress = false;
+      reject(new Error(`[zalo-bridge][${accountId}] QR login timed out — no scan after 10 minutes`));
     }, QR_WINDOW_MS);
 
     zalo
       .loginQR({ userAgent: USER_AGENT }, (event) => {
-        console.log('event:: ', event);
         switch (event.type) {
           case LoginQRCallbackEventType.QRCodeGenerated: {
             const raw = event.data.image.replace(/^data:image\/[^;]+;base64,/, '');
-            pendingQR = Buffer.from(raw, 'base64');
-            pendingQRExpiresAt = Date.now() + 90_000;
+            state.pendingQR = Buffer.from(raw, 'base64');
+            state.pendingQRExpiresAt = Date.now() + 90_000;
+            console.log(`[zalo-bridge][${accountId}] scan this QR to log in`);
             qrcodeTerminal.generate(`http://zaloapp.com/qr/l?tk=${event.data.token}`, {
               small: true,
             });
             clearTimeout(timeout);
             timeout = setTimeout(() => {
-              loginInProgress = false;
-              reject(new Error('[zalo-bridge] QR login timed out — no scan after 10 minutes'));
+              state.loginInProgress = false;
+              reject(
+                new Error(`[zalo-bridge][${accountId}] QR login timed out — no scan after 10 minutes`),
+              );
             }, QR_WINDOW_MS);
             break;
           }
           case LoginQRCallbackEventType.QRCodeScanned: {
-            console.log('[zalo-bridge] QR scanned — confirming login...');
-            pendingQR = null;
+            console.log(`[zalo-bridge][${accountId}] QR scanned — confirming login...`);
+            state.pendingQR = null;
             break;
           }
           case LoginQRCallbackEventType.QRCodeExpired: {
-            console.log('[zalo-bridge] QR expired — retrying...');
+            console.log(`[zalo-bridge][${accountId}] QR expired — retrying...`);
             event.actions.retry();
             break;
           }
           case LoginQRCallbackEventType.QRCodeDeclined: {
-            console.warn('[zalo-bridge] QR scan declined by user');
+            console.warn(`[zalo-bridge][${accountId}] QR scan declined by user`);
             break;
           }
           case LoginQRCallbackEventType.GotLoginInfo: {
-            console.log('[zalo-bridge] login credentials received');
+            console.log(`[zalo-bridge][${accountId}] login credentials received`);
             captured = {
               imei: event.data.imei,
               cookie: event.data.cookie,
@@ -121,8 +182,8 @@ async function loginWithQR(zalo: Zalo): Promise<API> {
       })
       .then(async (api) => {
         clearTimeout(timeout);
-        loginInProgress = false;
-        pendingQR = null;
+        state.loginInProgress = false;
+        state.pendingQR = null;
 
         // Fallback credential extraction (openzca client.ts line 291-304)
         if (!captured) {
@@ -137,62 +198,62 @@ async function loginWithQR(zalo: Zalo): Promise<API> {
           };
         }
 
-        let fetchedOwnId = '';
-        try {
-          const info = await api.fetchAccountInfo();
-          fetchedOwnId = info.profile.userId;
-        } catch {
-          console.warn('[zalo-bridge] could not fetch ownId after QR login');
-        }
+        state.ownId = await fetchOwnId(api, accountId);
+        state.api = api;
 
-        ownId = fetchedOwnId || null;
-        _api = api;
-
-        await saveCredentials(CREDENTIALS_FILE, captured);
-        console.log('[zalo-bridge] credentials saved after QR login');
+        await saveCredentials(sessionFile(accountId), captured);
+        console.log(`[zalo-bridge][${accountId}] credentials saved after QR login`);
 
         resolve(api);
       })
       .catch((err) => {
         clearTimeout(timeout);
-        loginInProgress = false;
+        state.loginInProgress = false;
         reject(err);
       });
   });
 }
 
-export async function createZaloClient(): Promise<API> {
+async function fetchOwnId(api: API, accountId: string): Promise<string | null> {
+  try {
+    const info = await api.fetchAccountInfo();
+    return info.profile.userId || null;
+  } catch {
+    console.warn(`[zalo-bridge][${accountId}] could not fetch ownId`);
+    return null;
+  }
+}
+
+/**
+ * Log in one account. Each account gets its own `Zalo` instance and its own
+ * credentials file — required for simultaneous multi-account operation.
+ */
+export async function createZaloClient(accountId: string = DEFAULT_ACCOUNT_ID): Promise<API> {
+  const state = stateOf(accountId);
   const zalo = new Zalo();
-  const saved = await loadCredentials(CREDENTIALS_FILE);
+  const credentialsPath = sessionFile(accountId);
+  const saved = await loadCredentials(credentialsPath);
 
   if (saved) {
     try {
-      console.log('[zalo-bridge] attempting login from saved credentials...');
+      console.log(`[zalo-bridge][${accountId}] attempting login from saved credentials...`);
       const api = await zalo.login(saved);
 
-      let fetchedOwnId = '';
-      try {
-        const info = await api.fetchAccountInfo();
-        fetchedOwnId = info.profile.userId;
-      } catch {
-        console.warn('[zalo-bridge] could not fetch ownId after credential login');
-      }
+      state.ownId = await fetchOwnId(api, accountId);
+      state.api = api;
 
-      ownId = fetchedOwnId || null;
-      _api = api;
-
-      console.log('[zalo-bridge] credential login successful');
+      console.log(`[zalo-bridge][${accountId}] credential login successful`);
       return api;
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       const isExpired = msg.includes('zpw_enk') || msg.toLowerCase().includes('login');
       console.warn(
-        `[zalo-bridge] credential login failed${isExpired ? ' (cookie expired/rejected)' : ''} — falling back to QR`,
+        `[zalo-bridge][${accountId}] credential login failed${isExpired ? ' (cookie expired/rejected)' : ''} — falling back to QR`,
         { error: msg },
       );
     }
   }
 
-  console.log('[zalo-bridge] waiting for QR scan...');
-  return loginWithQR(zalo);
+  console.log(`[zalo-bridge][${accountId}] waiting for QR scan...`);
+  return loginWithQR(zalo, accountId);
 }
